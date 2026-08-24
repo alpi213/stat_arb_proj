@@ -1,0 +1,39 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Data & results (regenerable; never commit raw data)
+data/raw/
+data/processed/
+results/
+*.parquet
+*.h5
+
+# Notebooks checkpoints
+.ipynb_checkpoints/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Claude Code session/tooling state (not project content)
+.claude/
+
+# Crypto data & results (regenerable)
+data/crypto/
+results_crypto/
+logs/
+configs/universe_perp_pit.csv

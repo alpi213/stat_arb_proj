@@ -1,0 +1,53 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "statarb"
+version = "0.1.0"
+description = "Cointegration-based statistical arbitrage with dynamic hedging, honest cost modeling, and capacity analysis"
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [{ name = "Alexandru Pitrop", email = "alex.pitrop24@gmail.com" }]
+dependencies = [
+    "numpy>=1.26",
+    "pandas>=2.1",
+    "scipy>=1.11",
+    "statsmodels>=0.14",
+    "yfinance>=0.2.40",
+    "pyarrow>=14.0",
+    "pydantic>=2.5",
+    "PyYAML>=6.0",
+    "matplotlib>=3.8",
+    "tqdm>=4.66",
+    "requests>=2.31",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4",
+    "pytest-cov>=4.1",
+    "ruff>=0.4",
+    "mypy>=1.8",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W", "N", "UP", "B"]
+# N806: uppercase locals (X, P, K, H, S, T) are the standard notation in
+# regression and Kalman-filter math; renaming them hurts readability.
+ignore = ["N806"]
+
+[tool.mypy]
+python_version = "3.10"
+ignore_missing_imports = true

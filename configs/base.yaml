@@ -1,0 +1,69 @@
+# Master configuration. Every experiment should be reproducible from a config
+# file + a git commit hash. Never hardcode parameters in code.
+
+data:
+  provider: yfinance          # yfinance | stooq | local_csv
+  cache_dir: data/processed
+  raw_dir: data/raw
+  start: "2015-01-01"
+  end: "2025-06-30"
+  frequency: 1d
+  universe_file: configs/universe.csv   # point-in-time membership file
+  min_history_days: 750                 # drop names with less usable history
+  max_missing_pct: 0.02                 # drop names with >2% missing bars
+
+pairs:
+  grouping: sector            # only test pairs within the same economic group
+  formation_window_days: 504  # ~2 years in-sample for pair selection
+  adf_pvalue_max: 0.05        # Engle-Granger residual ADF threshold
+  min_half_life_days: 2       # too fast = microstructure noise at daily bars
+  max_half_life_days: 60      # too slow = capital drag, weak signal
+  top_n_pairs: 20             # cap portfolio breadth
+  use_johansen: false         # optional robustness check
+
+hedge:
+  method: kalman              # static | kalman
+  kalman:
+    delta: 1.0e-5             # state transition variance scale (drift speed of beta)
+    obs_var: 1.0e-3           # observation noise variance
+  static:
+    refit_every_days: 63      # quarterly refit for the static baseline
+
+signals:
+  zscore_window: 60
+  entry_z: 2.0
+  exit_z: 0.5
+  stop_z: 3.5
+  max_holding_days: 40        # time stop: cointegration may have broken
+
+backtest:
+  initial_capital: 1_000_000
+  gross_per_pair: 0.10        # 10% of capital gross per pair (5% each leg)
+  execution_lag_bars: 1       # signal at close t -> trade at close t+1
+  costs:
+    commission_bps: 1.0       # per side
+    half_spread_bps: 2.5      # crossing half the bid-ask, per side
+    borrow_fee_annual_bps: 50 # general-collateral borrow on the short leg
+  risk:
+    max_gross_leverage: 2.0
+    max_pairs_concurrent: 20
+
+capacity:
+  impact_model: sqrt_law      # sqrt_law | almgren_chriss
+  impact_coef: 0.1            # k in impact = k * sigma_daily * sqrt(Q / ADV)
+  adv_window_days: 21
+  aum_grid: [1e6, 5e6, 1e7, 2.5e7, 5e7, 1e8, 2.5e8, 5e8, 1e9]
+
+validation:
+  walkforward:
+    formation_days: 504       # re-select pairs on this window
+    trading_days: 126         # then trade out-of-sample for ~6 months
+    step_days: 126            # roll forward
+  n_trials: 1                 # UPDATE this with every config you try (for DSR)
+  regimes:
+    covid_crash: ["2020-02-15", "2020-04-30"]
+    rate_shock_2022: ["2022-01-01", "2022-10-31"]
+    banking_stress_2023: ["2023-03-01", "2023-05-31"]
+
+output_dir: results
+seed: 42
