@@ -1,17 +1,13 @@
-"""Generic cross-sectional weights backtester.
+"""Weights-based backtester for anything cross-sectional (crypto carry here).
 
-Complements `backtest.engine` (which is pair-specific). Anything that can be
-expressed as "target weights per instrument per period" runs through here:
-crypto carry, cross-sectional momentum, factor tilts.
+Convention, mirroring the pair engine:
 
-Contract (mirrors the equity engine's discipline):
-    weights.loc[t]        = position HELD over (t, t+1]
-    asset_returns.loc[t]  = return EARNED over (t, t+1]
+    weights.loc[t]        position held over (t, t+1]
+    asset_returns.loc[t]  return earned over (t, t+1]
 
-Both are indexed at t, so they multiply elementwise with no shifting inside
-this function. Callers are responsible for building `asset_returns` with the
-forward-looking convention (see crypto.funding.carry_returns) — this keeps
-exactly one place in the codebase where a lag can be wrong, instead of two.
+Both indexed at t, so they multiply with no shifting here. The caller
+builds `asset_returns` forward-looking (see crypto.funding.carry_returns).
+That keeps the one place a lag can go wrong to exactly one place.
 """
 
 from __future__ import annotations
@@ -24,34 +20,23 @@ import pandas as pd
 
 @dataclass
 class CrossSectionalCostModel:
-    """Costs for a two-legged delta-neutral position (e.g. spot + perp).
+    """Costs for a two-legged position (spot + perp). Both legs trade on every rebalance.
 
-    Each unit of |weight change| requires trading BOTH legs, so per-unit
-    turnover cost is the sum across legs. Defaults are Binance retail taker
-    fees, which is the conservative assumption; a VIP tier or maker rebates
-    would improve this materially and should be sensitivity-tested.
+    Defaults are Binance retail taker fees, the conservative case. VIP tiers
+    and maker fills are much cheaper; the backtest script sweeps that.
     """
 
-    leg1_fee_bps: float = 4.0        # USD-M futures taker
-    leg2_fee_bps: float = 7.5        # spot taker
+    leg1_fee_bps: float = 4.0         # USD-M futures taker
+    leg2_fee_bps: float = 7.5         # spot taker
     leg1_half_spread_bps: float = 1.0
     leg2_half_spread_bps: float = 1.0
-    borrow_annual_bps: float = 0.0   # for short-spot legs, if used
-    periods_per_year: int = 1095     # 8h settlements
 
-    @property
-    def per_turnover_cost(self) -> float:
-        return (
+    def trading_cost(self, turnover: pd.Series) -> pd.Series:
+        per_unit = (
             self.leg1_fee_bps + self.leg2_fee_bps
             + self.leg1_half_spread_bps + self.leg2_half_spread_bps
         ) * 1e-4
-
-    def trading_cost(self, turnover: pd.Series) -> pd.Series:
-        return turnover * self.per_turnover_cost
-
-    def carry_cost(self, short_weight: pd.Series) -> pd.Series:
-        rate = self.borrow_annual_bps * 1e-4 / self.periods_per_year
-        return short_weight * rate
+        return turnover * per_unit
 
 
 def backtest_weights(
@@ -61,11 +46,8 @@ def backtest_weights(
     initial_capital: float = 1_000_000,
     max_gross_leverage: float = 1.0,
 ) -> dict:
-    """Run a weights-based cross-sectional backtest.
-
-    Returns dict with: returns (net), gross_returns, equity_curve, turnover,
-    gross_exposure, per_asset_pnl, weights (post-leverage-cap).
-    """
+    """Returns a dict with returns (net), gross_returns, equity_curve,
+    turnover, gross_exposure, per_asset_pnl and the weights actually used."""
     costs = costs or CrossSectionalCostModel()
 
     idx = weights.index.intersection(asset_returns.index)
@@ -73,9 +55,8 @@ def backtest_weights(
     w = weights.loc[idx, cols].fillna(0.0)
     r = asset_returns.loc[idx, cols]
 
-    # A weight on an asset with no return observation is unfillable — zero it
-    # rather than silently treating a NaN return as 0% (which would credit a
-    # position we could not have held).
+    # No return observation means the position could not have been held.
+    # Zero the weight rather than crediting a NaN as 0%.
     w = w.where(r.notna(), 0.0)
     r = r.fillna(0.0)
 
@@ -87,18 +68,29 @@ def backtest_weights(
     gross = per_asset.sum(axis=1)
 
     turnover = w.diff().abs().sum(axis=1)
-    turnover.iloc[0] = w.iloc[0].abs().sum()  # initial build-out is a real cost
-    short_w = w.clip(upper=0.0).abs().sum(axis=1)
+    turnover.iloc[0] = w.iloc[0].abs().sum()  # building the first book costs money too
 
-    net = gross - costs.trading_cost(turnover) - costs.carry_cost(short_w)
-    equity = initial_capital * (1 + net).cumprod()
-
+    net = gross - costs.trading_cost(turnover)
     return {
         "returns": net,
         "gross_returns": gross,
-        "equity_curve": equity,
+        "equity_curve": initial_capital * (1 + net).cumprod(),
         "turnover": turnover,
         "gross_exposure": w.abs().sum(axis=1),
         "per_asset_pnl": per_asset,
         "weights": w,
     }
+
+
+def exit_size(weights: pd.DataFrame, res: dict) -> pd.Series:
+    """Share of the book dropped each bar because a held asset stopped printing.
+
+    backtest_weights zeroes a weight with no return, which exits a dying
+    contract at its last good price for free. Subtract penalty * exit_size
+    from the returns to charge for that exit instead.
+    """
+    wanted = weights.reindex_like(res["weights"]).fillna(0.0)
+    held = res["weights"].shift(1).fillna(0.0)
+    dying = (wanted != 0) & (res["weights"] == 0) & (held != 0)
+    dying.iloc[-1] = False  # the sample ends there; nothing died
+    return (held.abs() * dying).sum(axis=1)

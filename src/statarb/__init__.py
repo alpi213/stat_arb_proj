@@ -1,3 +1,3 @@
-"""statarb: cointegration-based statistical arbitrage research framework."""
+"""statarb: does a stat-arb edge survive costs, and how much capital can it take?"""
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"

@@ -1,14 +1,28 @@
-"""Standard result plots. Every figure lands in results/figures/."""
+"""Logging setup and the three standard plots."""
 
 from __future__ import annotations
 
+import logging
+import sys
 from pathlib import Path
 
 import matplotlib
 
-matplotlib.use("Agg")  # headless-safe
-import matplotlib.pyplot as plt
-import pandas as pd
+matplotlib.use("Agg")  # no display needed
+import matplotlib.pyplot as plt  # noqa: E402
+import pandas as pd  # noqa: E402
+
+
+def setup_logging(level: int = logging.INFO) -> None:
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s %(levelname)-7s %(name)s: %(message)s",
+        datefmt="%H:%M:%S",
+        stream=sys.stdout,
+        force=True,
+    )
+    logging.getLogger("yfinance").setLevel(logging.WARNING)
+    logging.getLogger("peewee").setLevel(logging.WARNING)
 
 
 def _save(fig, out: Path) -> Path:
@@ -20,9 +34,7 @@ def _save(fig, out: Path) -> Path:
 
 
 def plot_equity(equity: pd.Series, out: Path, title: str = "Equity curve") -> Path:
-    fig, (ax1, ax2) = plt.subplots(
-        2, 1, figsize=(10, 6), sharex=True, height_ratios=[3, 1]
-    )
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 6), sharex=True, height_ratios=[3, 1])
     ax1.plot(equity.index, equity.values, lw=1.2)
     ax1.set_title(title)
     ax1.set_ylabel("Equity ($)")
@@ -33,10 +45,10 @@ def plot_equity(equity: pd.Series, out: Path, title: str = "Equity curve") -> Pa
 
 
 def plot_pair_diagnostics(result, out: Path) -> Path:
-    """Spread, z-score with entry/exit bands, and beta path for one pair."""
+    """Spread, z-score with entry/stop bands, and the beta path for one pair."""
     fig, axes = plt.subplots(3, 1, figsize=(10, 8), sharex=True)
     axes[0].plot(result.spread.index, result.spread.values, lw=0.8)
-    axes[0].set_title(f"{result.pair} — spread")
+    axes[0].set_title(f"{result.pair}: spread")
     axes[1].plot(result.zscore.index, result.zscore.values, lw=0.8)
     for lvl, c in [(2, "tab:orange"), (-2, "tab:orange"), (3.5, "tab:red"), (-3.5, "tab:red")]:
         axes[1].axhline(lvl, ls="--", lw=0.6, color=c)

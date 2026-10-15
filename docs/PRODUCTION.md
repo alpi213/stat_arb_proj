@@ -1,61 +1,39 @@
-# Path to production
+# What would have to change before running live
 
-What separates this research repo from a deployable system, in the order you'd
-actually build it. Useful both as a roadmap and as interview material ("here's
-exactly what I'd add before risking capital").
+This part contains the elements that would need to be built to bring the model in production.
 
-## 1. Data infrastructure
-
-- Replace yfinance with a contractual vendor (Polygon, Databento, Norgate for PIT
-  membership). Store **raw vendor payloads immutably** + adjustment factors
-  separately; derive adjusted series on read. Never mutate history in place.
-- Nightly ingestion job with checks that fail loudly: row counts vs calendar,
-  cross-vendor spot checks, adjustment-factor diffs. A silent data gap is a silent
-  position error two days later.
-- At >500 names or intraday bars, move the store to ClickHouse/TimescaleDB behind
-  the existing `PriceStore` interface.
-
-## 2. Research/production parity
-
-- The signal path (`hedge` → `signals`) must be the SAME code in backtest and live.
-  The engine differs (simulated fills vs broker API); the signal code must not.
-  Guard with a **shadow test**: run yesterday's live inputs through the backtester
-  and assert identical target positions.
-- Pin the environment (lockfile/container digest). Log (config hash, code hash,
-  data manifest hash) with every run — three hashes fully identify any result.
-
-## 3. Execution layer
-
-- Order manager: target-position in, child orders out. Start with broker
-  IOC/limit-at-mid via IBKR or Alpaca paper first.
-- Model→actual slippage telemetry from day one: realized shortfall per order vs the
-  cost model's prediction. This is also how you eventually **calibrate `k`** in the
-  impact model from your own fills — closing the loop on the capacity estimate.
-- Borrow: pre-trade locate check; hard-to-borrow names excluded at selection time,
-  borrow rate fed per-name into `CostModel` (interface already accepts it).
-
-## 4. Risk controls (before first live dollar)
-
-- Pre-trade: max order size vs ADV, max gross/net, max per-name concentration,
-  fat-finger price collars.
-- Intraday kill conditions: portfolio drawdown limit, per-pair z-score beyond stop
-  without a fill, data staleness (no price update in N minutes → flatten nothing,
-  alert, block new orders).
-- Cointegration health monitor: rolling ADF p-value per live pair; auto-quarantine
-  pairs whose relationship degrades instead of waiting for the stop.
-
-## 5. Operations
-
-- Everything is a DAG (even cron + Makefile beats hidden manual steps; Airflow or
-  Prefect when the step count grows): ingest → quality gate → signals → orders →
-  reconciliation → P&L attribution.
-- End-of-day reconciliation: broker positions/cash vs model book, penny-exact or
-  page someone.
-- P&L attribution per pair per day (gross alpha, costs, borrow, impact) — when the
-  live Sharpe misses the backtest, this is how you find out which assumption broke.
-
-## 6. Capital scaling discipline
-
-- Deploy at a fraction of the model capacity estimate (e.g. 10%), grow only as
-  realized slippage matches predicted. The capacity curve from `04_capacity.py`
-  becomes a living document recalibrated from telemetry, not a one-off chart.
+1. **Data.** yfinance is fine for research, but a live system needs a paid data vendor under contract.
+   Every raw delivery is stored exactly as received and price adjustments for splits and dividends are
+   kept in a separate table, so the full history can always be rebuilt. Data loads every night and is
+   checked before anything uses it. Does the row count match the trading calendar? Do a sample of
+   prices agree with a second vendor? If a check fails, the pipeline stops and raises an alert.
+   A gap that goes unnoticed today turns into a wrong position two days later.
+2. **Research and production parity.** The code that turns data into signals
+   (`hedge`, `signals`, `crypto.funding`) is identical in the backtest and in production.
+   A daily test proves it by running yesterday’s live inputs through the backtester and confirming
+   that the target positions match exactly. Every run also records the code version, the settings
+   and the data it used, so any result can be reproduced later.
+3. **Execution.** An order manager takes the target positions and splits them into smaller
+   orders for the market. From the first trade, it compares each fill with what the cost model
+   predicted. That comparison calibrates the market-impact model on real trades instead of
+   assumptions, which in turn shows how much capital the strategy can really handle. For equities,
+   it confirms shares can be borrowed before any short sale and tracks the borrowing cost
+   per stock. For the crypto carry trade, it uses passive limit orders and has a defined
+   response when one side of the trade fills and the other doesn’t.
+4. **Risk controls.** Every order is checked before it goes out: size relative to the stock’s
+   average daily volume, total and net exposure limits, concentration in any one name
+   and a reasonable price range. During the day, the system watches portfolio drawdown
+   and blocks new orders if market data hasn’t updated within a set number of minutes.
+   For the carry trade, it simulates margin calls and liquidation risk on the short perpetual-futures
+   side. For pairs trades, it keeps checking whether each pair still moves together and removes
+   a pair that breaks down before it reaches its stop-loss.
+5. **Operations.** The daily cycle runs as a chain of scheduled steps: load data, check quality,
+   compute signals, place orders, reconcile and explain P&L. At the end of each day,
+   the positions reported by the broker are matched against the positions the model expects.
+   P&L is broken down by position and by day into gross return, trading costs,
+   borrowing fees and market impact. When live results fall short of the backtest,
+   the breakdown shows which assumption failed.
+6. **Scaling.** Trading starts at around 10% of the capital the model says the strategy can take.
+   It grows only while real trading costs stay in line with the predictions. Capacity then
+   becomes a figure that live trading data keeps updating, not a chart made once
+   and never revisited.

@@ -1,14 +1,19 @@
-from statarb.backtest.costs import CostModel
-from statarb.backtest.engine import PairBacktestResult, backtest_pair, backtest_portfolio
+from statarb.backtest.engine import (
+    CostModel,
+    PairBacktestResult,
+    backtest_pair,
+    backtest_portfolio,
+)
 from statarb.backtest.metrics import performance_summary
-from statarb.backtest.portfolio import CrossSectionalCostModel, backtest_weights
+from statarb.backtest.portfolio import CrossSectionalCostModel, backtest_weights, exit_size
 
 __all__ = [
     "CostModel",
+    "PairBacktestResult",
     "backtest_pair",
     "backtest_portfolio",
-    "PairBacktestResult",
     "performance_summary",
-    "backtest_weights",
     "CrossSectionalCostModel",
+    "backtest_weights",
+    "exit_size",
 ]

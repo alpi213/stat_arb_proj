@@ -1,33 +1,42 @@
-"""Funding-carry panel construction and signal.
+"""Funding-carry panel, signal and per-asset returns.
 
-Timing convention — the thing that makes or breaks this backtest:
+Timing, which is the whole game here:
 
-    decision at settlement t  ->  position held over (t, t+1]  ->  earns f_{t+1}
+    decide at settlement t  ->  hold over (t, t+1]  ->  earn f_{t+1}
 
-At time t you observe funding rates up to and including f_t (already paid) and
-the current basis. You then choose weights for the NEXT interval, which earns
-the NEXT funding payment f_{t+1}. So the trading problem is genuinely
-*predicting* funding, never observing it. `carry_signal` returns weights
-indexed at t meaning "held over (t, t+1]"; the backtester shifts returns
-accordingly and never lets f_{t+1} inform w_t.
+At t you know every funding payment up to f_t. You pick weights for the
+next interval, and those weights earn the next payment. `carry_signal`
+returns weights indexed at t meaning "held over (t, t+1]"; `carry_returns`
+returns the matching forward return, also indexed at t. The backtester
+multiplies them and never shifts.
 
-Why a naive predictor works: funding is strongly autocorrelated (crowded
-positioning persists for days-to-weeks), so an EWMA of past funding is a
-legitimately good forecast. That is the edge — persistence of a risk-transfer
-premium, not a fitted pattern.
+Funding is strongly autocorrelated (crowded positioning persists for
+days), so an EWMA of past funding is a decent forecast. That persistence
+is the edge.
 """
 
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
 logger = logging.getLogger(__name__)
 
-# Binance USD-M funding settles every 8h -> 3/day -> 1095/yr
-PERIODS_PER_YEAR = 365 * 3
+PERIODS_PER_YEAR = 365 * 3  # 8h settlements
+
+
+def load_panel(data_dir: str | Path) -> dict[str, pd.DataFrame]:
+    """Read the parquet files written by scripts/11_download_crypto.py."""
+    d = Path(data_dir)
+    frames = {name: pd.read_parquet(d / f"{name}.parquet")
+              for name in ("funding", "perp_close", "spot_close", "quote_volume")}
+    as_dict = {k: {c: v[c] for c in v} for k, v in frames.items()}
+    return build_carry_panel(
+        as_dict["funding"], as_dict["perp_close"], as_dict["spot_close"], as_dict["quote_volume"]
+    )
 
 
 def build_carry_panel(
@@ -38,20 +47,31 @@ def build_carry_panel(
     min_history: int = 200,
     freq: str = "8h",
 ) -> dict[str, pd.DataFrame]:
-    """Align per-symbol series onto a REGULAR `freq` grid.
+    """Align everything onto a regular `freq` grid.
 
-    Binance does not use one funding schedule: most symbols settle every 8h,
-    but some were moved to 4h. Taking the union of raw funding timestamps
-    produces a ragged grid on which 8h symbols are NaN half the time — which
-    silently corrupts every downstream rolling statistic. So we normalize:
+    Returns funding, perp, spot, basis (bps) and dollar_volume frames.
 
-    - funding is SUMMED into each bucket (it is a cash flow: two 4h payments
-      inside one 8h bucket are economically one 8h payment). Timestamps are
-      rounded UP to the bucket close, so a payment at 04:00 belongs to the
-      08:00 bucket — it happened *during* that interval, not before it.
-    - prices are taken as the last observation at//before the grid point.
+    Binance does not settle every symbol on the same schedule: most are 8h,
+    some moved to 4h. A ragged union of raw timestamps would leave 8h
+    symbols NaN half the time and corrupt every rolling statistic, so
+    funding is summed into each bucket (two 4h payments are one 8h payment)
+    and prices take the last print at or before each grid point.
 
-    Returns dict with keys: funding, perp, spot, basis, dollar_volume.
+    Three data problems around delistings are handled here, each of which
+    fabricated P&L before it was caught:
+
+    1. Settlement timestamps carry millisecond jitter (00:00:00.006). A
+       plain ceil() pushes an on-time payment a whole interval forward,
+       colliding with the next one. 16% of the panel was holes before the
+       timestamps were rounded to the minute first.
+    2. Perp and spot stop printing at different times when a contract dies.
+       Forward-filling each leg separately freezes one leg while the other
+       moves, which looks like a huge basis move that never happened. Both
+       legs are cut at their shared last real print instead.
+    3. Binance keeps publishing bars for a dead contract: volume 0, price
+       frozen. UNFIUSDT's perp sat at 1.730 for seven days while spot kept
+       trading. A zero-volume bar has no valid mark, so it becomes NaN and
+       the backtester flattens the position.
     """
     keep = [s for s, f in funding.items() if len(f.dropna()) >= min_history]
     dropped = sorted(set(funding) - set(keep))
@@ -66,63 +86,28 @@ def build_carry_panel(
     f_cols = {}
     for s in keep:
         ser = funding[s].dropna()
-        # Binance settlement stamps carry millisecond jitter (e.g.
-        # 00:00:00.006). Bucketing those directly with ceil() shoves an
-        # on-time payment a FULL interval forward, where it collides with the
-        # next one and leaves the true slot empty — we measured 634 such
-        # holes (16% of the panel) before snapping. Round the jitter away
-        # first, THEN ceil, so that:
-        #   00:00:00.006 -> 00:00  (an on-time 8h settlement, stays put)
-        #   04:00        -> 08:00  (a 4h settlement, folds into its 8h bucket)
-        snapped = ser.index.round("1min").ceil(freq)
-        agg = ser.groupby(snapped).sum()
-        f_cols[s] = agg.reindex(grid)
+        # Round the jitter away, then ceil: 00:00:00.006 stays at 00:00,
+        # a 04:00 payment folds into the 08:00 bucket.
+        bucket = ser.index.round("1min").ceil(freq)
+        f_cols[s] = ser.groupby(bucket).sum().reindex(grid)
     f = pd.DataFrame(f_cols, index=grid)
+    logger.info("panel grid %s: %d rows, %d symbols", freq, len(grid), len(keep))
 
-    n_per_bucket = pd.Series(
-        {s: len(funding[s].dropna()) for s in keep}
-    )
-    logger.info(
-        "panel grid %s: %d rows; raw funding obs per symbol %d..%d",
-        freq, len(grid), int(n_per_bucket.min()), int(n_per_bucket.max()),
-    )
-
-    def _align(d: dict[str, pd.Series]) -> pd.DataFrame:
+    def align(d: dict[str, pd.Series]) -> pd.DataFrame:
         cols = {}
         for s in keep:
             ser = d.get(s)
-            if ser is None or len(ser.dropna()) == 0:
+            if ser is None or ser.dropna().empty:
                 cols[s] = pd.Series(np.nan, index=grid)
             else:
-                # last observation at or before each grid point; never backward
                 cols[s] = ser.dropna().reindex(grid, method="ffill", limit=1)
         return pd.DataFrame(cols, index=grid)
 
-    perp = _align(perp_close)
-    spot = _align(spot_close)
-    vol = _align(quote_volume) if quote_volume else pd.DataFrame(np.nan, index=grid, columns=keep)
+    perp = align(perp_close)
+    spot = align(spot_close)
+    vol = align(quote_volume) if quote_volume else pd.DataFrame(np.nan, index=grid, columns=keep)
 
-    # SETTLE AT THE TRUE DELISTING PRICE, not a stale ffilled one.
-    #
-    # A delta-neutral position needs a genuine, simultaneous quote on BOTH
-    # legs. In practice the two legs stop trading at slightly different
-    # times when a contract is delisted (Binance typically halts the perp
-    # and the spot market on different schedules). `_align`'s
-    # ffill(limit=1) — needed elsewhere to paper over an isolated missing
-    # bar — does this independently per field, so the leg that stopped
-    # first gets its last print frozen for one extra bar while the other
-    # leg keeps moving. That fabricates a basis divergence that never
-    # existed: measured directly on LUNAUSDT/SRMUSDT/etc, this produced
-    # spurious bars like spot_ret=-96%, perp_ret=0% right at the real
-    # settlement point — a data artifact, not economics.
-    #
-    # Fix: for each symbol, find the last bar where BOTH legs had a real
-    # (non-ffilled) print — the last moment a position could actually be
-    # marked and closed on both legs — and NaN everything past it for that
-    # symbol, on both legs. The final realized return is then computed
-    # real-price-to-real-price on both sides (the true delisting price),
-    # and the position goes flat cleanly afterward: `backtest_weights`
-    # already zeroes weight/P&L on a NaN return.
+    # Cut both legs at the last bar where both had a real print.
     for s in keep:
         last_perp = perp_close.get(s, pd.Series(dtype=float)).dropna()
         last_spot = spot_close.get(s, pd.Series(dtype=float)).dropna()
@@ -135,113 +120,66 @@ def build_carry_panel(
             spot.loc[beyond, s] = np.nan
             vol.loc[beyond, s] = np.nan
 
-    # ZERO-VOLUME BARS ARE NOT PRICES.
-    #
-    # The truncation above only catches a contract whose data STOPS. Binance
-    # often keeps PUBLISHING bars for a dead contract: zero volume, price
-    # frozen at the last real trade. Measured on UNFIUSDT, the perp printed
-    # volume=0 with price pinned at 1.730 for seven straight days before its
-    # delisting, while the spot leg kept trading. A frozen perp against a live
-    # spot is not a hedged position — it silently becomes naked directional
-    # exposure, and the resulting P&L is pure artifact. (This cost us a -9.9%
-    # "loss" we initially mistook for a genuine delisting event.)
-    #
-    # A bar with no trades has no valid mark, so NaN the price: `carry_returns`
-    # then yields NaN and `backtest_weights` flattens the position instead of
-    # marking it against a stale quote.
+    # A bar with no trades has no price.
     if quote_volume:
         dead = vol.fillna(0.0) <= 0.0
         perp = perp.mask(dead)
         spot = spot.mask(dead)
 
-    # basis in bps: how far the perp trades above spot
     basis = (perp / spot - 1.0) * 1e4
-
     return {"funding": f, "perp": perp, "spot": spot, "basis": basis, "dollar_volume": vol}
 
 
 def carry_signal(
     panel: dict[str, pd.DataFrame],
-    lookback: int = 21,           # ~7 days of 8h settlements
+    lookback: int = 21,              # 7 days of 8h settlements
     top_n: int = 10,
     min_predicted_bps: float = 1.0,
     max_predicted_bps: float = 50.0,
     allow_short_carry: bool = True,
     min_dollar_volume: float = 5e6,
-    rebalance_every: int = 3,     # 3 x 8h = daily
-    hysteresis: float = 2.0,      # hold while rank <= top_n * hysteresis
+    rebalance_every: int = 21,       # settlements between rebalances (7 days)
+    hysteresis: float = 3.0,         # keep a holding while its rank <= top_n * hysteresis
     max_weight_per_symbol: float = 0.15,
+    rebalance_offset: int = 0,       # which settlement in the cycle rebalances
 ) -> pd.DataFrame:
-    """Cross-sectional funding carry weights.
+    """Cross-sectional carry weights, indexed at t and held over (t, t+1].
 
-    w > 0  : long spot / short perp  (collect positive funding)
-    w < 0  : short spot / long perp  (collect negative funding)
+    w > 0 is long spot / short perp (collect positive funding), w < 0 the
+    reverse. Equal weight within the basket, capped per symbol, gross at
+    most 1.0. Every input to row t uses data through t only.
 
-    Every input to row t uses data through t only. Weights are equal-weight
-    within the selected basket, capped at `max_weight_per_symbol`, and sum to
-    AT MOST 1.0 gross — a thin book deliberately runs under-invested rather
-    than concentrated (see CONCENTRATION CAP below).
+    Turnover control is what makes this tradeable, not a tuning knob.
+    Funding accrues whether or not you trade, so the right book is sticky.
+    Re-ranking every 8h turns over ~480x a year and loses money at retail
+    fees. Two fixes: only revisit the book every `rebalance_every`
+    settlements and keep an incumbent while it is still inside the top
+    `top_n * hysteresis`, so a name wobbling around the cutoff is not traded
+    in and out. rebalance_every=1, hysteresis=1.0 recovers the naive book.
+    `rebalance_offset` shifts which settlements rebalance; results that
+    swing with it are calendar luck, not signal.
 
-    TURNOVER CONTROL — this is not a tuning knob, it is what makes the
-    strategy implementable. Funding accrues every settlement regardless of
-    whether you trade, so the optimal book is *sticky*: you want the carry,
-    not the churn. Naive "re-rank and equal-weight every 8h" turns over ~50%
-    of the book per settlement (~540x/yr), which at realistic fees costs more
-    than the entire premium. Two standard fixes:
+    The per-symbol cap matters when the book thins out. Without it,
+    `sign / len(held)` turned 3 survivors into 33% positions, one of
+    them a contract mid-delisting. With it, a thin book remains under-invested.
 
-    - `rebalance_every`: only revisit the book every k settlements.
-    - `hysteresis`: an incumbent position is retained while it stays within
-      `top_n * hysteresis` in rank, so a name oscillating around the cutoff
-      is not traded in and out. Only clear losers are replaced.
-
-    Set rebalance_every=1, hysteresis=1.0 to recover the naive behaviour.
-
-    CONCENTRATION CAP — `max_weight_per_symbol`. Equal-weighting as
-    `sign / len(held)` silently turns a SHRINKING book into a concentrated
-    one: when few names pass the funding/liquidity gates, each surviving
-    position balloons. Measured on the point-in-time universe, the book
-    collapsed to 3 names in Nov 2024 and put 33% of capital into a single
-    symbol (UNFIUSDT) that was in the middle of its spot delisting — and
-    flipped from short-carry to long-carry mid-event. That one position cost
-    -9.9% over four days.
-
-    The cap divides by `max(len(held), 1/max_weight)` instead, so a thin book
-    runs at REDUCED GROSS rather than concentrated full gross. If there are
-    only 3 opportunities, hold 3 small positions — do not lever into them.
-    Gross exposure becomes a consequence of opportunity count, which is the
-    economically correct behaviour for a carry book.
+    `max_predicted_bps` is a risk control. Funding of -250bp per 8h is a
+    short squeeze with an unborrowable spot leg, not carry. One such
+    episode (TRBUSDT, autumn 2023) was 36% of gross P&L before this gate.
     """
     f = panel["funding"]
-    # EWMA forecast of next funding, computed causally (ewm at t uses only
-    # rows <= t, and f_t is already paid at t).
     pred = f.ewm(span=lookback, min_periods=max(5, lookback // 3)).mean()
+    pred_bps = pred * 1e4
 
-    # Liquidity gate: don't select a symbol we could not actually trade.
+    # Liquidity: a rolling mean can be propped up for weeks by one liquidation
+    # spike, so also require that the current bar actually traded.
     vol = panel["dollar_volume"].rolling(lookback, min_periods=5).mean()
     tradeable = (vol >= min_dollar_volume) | vol.isna()
-    # A rolling MEAN is not enough: one liquidation-driven volume spike keeps
-    # the average above the floor for weeks while the book is already dead.
-    # UNFIUSDT printed $400M on a single day, then zero volume for the next
-    # seven — and stayed "eligible" the whole time. Require the CURRENT bar to
-    # have traded at all, which is the observable a real desk would check.
     tradeable &= panel["dollar_volume"].fillna(0.0) > 0.0
-    # LISTING gate: the contract must actually be settling funding right now.
-    # Without this a delisted symbol stays "eligible" forever — its volume is
-    # NaN (which the liquidity gate lets through) and the EWMA carries its last
-    # funding value indefinitely, so the book would hold a contract that no
-    # longer exists. Harmless on a survivor-only universe where nothing ever
-    # dies; essential on a point-in-time one, which is exactly the universe
-    # where survivorship bias is being measured.
-    tradeable &= panel["funding"].notna() & panel["perp"].notna()
+    # Listing: the contract must be settling funding right now, or a delisted
+    # symbol stays eligible forever on its last EWMA value.
+    tradeable &= f.notna() & panel["perp"].notna()
 
-    pred_bps = pred * 1e4
-    # Upper gate (`max_predicted_bps`) is a RISK CONTROL, not a return filter.
-    # Funding of -250bp per 8h is not a carry opportunity, it is a short
-    # squeeze: the spot leg is unborrowable, the perp is being manipulated,
-    # and the size you could actually execute is a small fraction of what the
-    # backtest assumes. Without this gate a single such episode (TRBUSDT,
-    # Sept-Oct 2023) contributed 36% of gross P&L in our sample — a number
-    # that would not have survived contact with a real order book.
     eligible = (
         tradeable
         & pred_bps.abs().ge(min_predicted_bps)
@@ -249,23 +187,19 @@ def carry_signal(
     )
     scores = pred_bps.where(eligible)
     keep_n = max(int(round(top_n * hysteresis)), top_n)
-
-    weights = pd.DataFrame(0.0, index=f.index, columns=f.columns)
-    held: dict[str, float] = {}       # symbol -> sign of current position
-    # A thin book runs at reduced gross rather than concentrated full gross.
     min_denom = int(np.ceil(1.0 / max_weight_per_symbol)) if max_weight_per_symbol > 0 else 1
 
-    def _apply(t, held):
-        if not held:
-            return
-        syms = list(held)
-        denom = max(len(syms), min_denom)
-        weights.loc[t, syms] = [held[s] / denom for s in syms]
+    weights = pd.DataFrame(0.0, index=f.index, columns=f.columns)
+    held: dict[str, float] = {}  # symbol -> +1 / -1
+
+    def write(t, held):
+        if held:
+            denom = max(len(held), min_denom)
+            weights.loc[t, list(held)] = [sign / denom for sign in held.values()]
 
     for i, (t, row) in enumerate(scores.iterrows()):
-        if i % rebalance_every != 0:
-            # Between rebalances the book is unchanged (no trading).
-            _apply(t, held)
+        if (i - rebalance_offset) % rebalance_every != 0:
+            write(t, held)
             continue
 
         row = row.dropna()
@@ -275,26 +209,20 @@ def carry_signal(
 
         longs = row[row > 0]
         shorts = row[row < 0] if allow_short_carry else row.iloc[:0]
-        # Fill candidates must stay in RANK ORDER (lists), because the slot cap
-        # below stops early — iterating a set here made the choice depend on
-        # Python's per-process string hash salt, so the same config on the same
-        # data produced different books (measured: Sharpe 5.7851 vs 5.7895 on
-        # back-to-back runs) and could drop a better-scoring name for a worse
-        # one. Sets are still fine for the pure membership tests.
+        # Lists, in rank order. Iterating a set here made the book depend on
+        # Python's per-process hash seed and changed results run to run.
         fresh_long = list(longs.nlargest(top_n).index)
         fresh_short = list(shorts.nsmallest(top_n).index)
         wide_long = set(longs.nlargest(keep_n).index)
         wide_short = set(shorts.nsmallest(keep_n).index)
 
         new_held: dict[str, float] = {}
-        # 1. incumbents survive if still inside the wider band, same direction
-        for s, sign in held.items():
+        for s, sign in held.items():  # incumbents survive inside the wide band
             if sign > 0 and s in wide_long:
                 new_held[s] = 1.0
             elif sign < 0 and s in wide_short:
                 new_held[s] = -1.0
-        # 2. fill remaining slots from the fresh top-N
-        for s in fresh_long:
+        for s in fresh_long:  # then fill from the fresh top-N
             if len(new_held) >= 2 * top_n:
                 break
             new_held.setdefault(s, 1.0)
@@ -304,30 +232,22 @@ def carry_signal(
             new_held.setdefault(s, -1.0)
 
         held = new_held
-        _apply(t, held)
+        write(t, held)
 
     return weights
 
 
 def carry_returns(panel: dict[str, pd.DataFrame]) -> pd.DataFrame:
-    """Per-symbol return of a UNIT carry position over (t, t+1], indexed at t.
+    """Return of a unit carry position (w = +1) over (t, t+1], indexed at t.
 
-    Components, for w=+1 (long spot, short perp):
-        + f_{t+1}                       funding received at next settlement
-        + spot_ret - perp_ret           basis convergence (delta-neutral residual)
+        f_{t+1} + spot_ret - perp_ret
 
-    Indexed at t so it lines up with weights decided at t. The backtester
-    therefore never needs to shift again — and cannot double-shift.
+    fill_method=None is required: older pandas forward-fills before
+    differencing, which turns a NaN dead-contract price into a fake 0%
+    return. The default changed in pandas 3.0, so the same code gave
+    different answers locally and in CI until this was pinned.
     """
     f_next = panel["funding"].shift(-1)
-    # fill_method=None is NOT optional here. pandas' pct_change() defaults to
-    # fill_method="pad" on <3.0, which forward-fills NaN gaps before
-    # differencing -- silently converting a masked dead-contract price into a
-    # fabricated 0% return, exactly the artifact `build_carry_panel` NaNs
-    # those bars to prevent. This default is also version-dependent: it
-    # flipped in pandas 3.0, so identical code produced correct results
-    # locally (pandas 3.0.5) and a fabricated 0% return in CI (pandas 2.3.3)
-    # -- caught by test_zero_volume_bars_are_not_treated_as_prices.
     spot_ret = panel["spot"].pct_change(fill_method=None).shift(-1)
     perp_ret = panel["perp"].pct_change(fill_method=None).shift(-1)
     return (f_next + spot_ret - perp_ret).replace([np.inf, -np.inf], np.nan)
