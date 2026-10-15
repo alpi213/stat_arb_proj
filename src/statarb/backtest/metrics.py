@@ -1,14 +1,9 @@
 """Performance metrics.
 
-Conventions: risk-free assumed 0 (state this in the writeup; at 2015-2025 cash
-rates it flatters absolute Sharpe slightly — or pass `rf_annual` to be strict).
-
-`periods_per_year` generalizes annualization beyond daily bars:
-    252  daily equities (default)
-    1095 8-hour crypto funding settlements (365 * 3)
-    8760 hourly
-Getting this wrong rescales Sharpe by sqrt(ratio), which is the single easiest
-way to accidentally report a fake number.
+Risk-free rate is 0 unless `rf_annual` is passed. `periods_per_year` is
+252 for daily bars and 1095 for 8h crypto settlements; getting it wrong
+rescales Sharpe by the square root of the ratio, which is the easiest way
+to report a fake number.
 """
 
 from __future__ import annotations
@@ -38,8 +33,7 @@ def sortino_ratio(returns: pd.Series, rf_annual: float = 0.0,
 
 
 def max_drawdown(equity: pd.Series) -> float:
-    dd = equity / equity.cummax() - 1.0
-    return float(dd.min())
+    return float((equity / equity.cummax() - 1.0).min())
 
 
 def cagr(equity: pd.Series, periods_per_year: int = TRADING_DAYS) -> float:
@@ -87,22 +81,17 @@ def performance_summary(
         "pct_positive": float((returns > 0).mean()),
     }
 
-    if trades:
-        closed = [t for t in trades if t.exit_date is not None]
-        if closed:
-            pnls = np.array([t.pnl_return for t in closed])
-            out.update(
-                {
-                    "n_trades": len(closed),
-                    "hit_rate": float((pnls > 0).mean()),
-                    "avg_win": float(pnls[pnls > 0].mean()) if (pnls > 0).any() else np.nan,
-                    "avg_loss": float(pnls[pnls < 0].mean()) if (pnls < 0).any() else np.nan,
-                    "avg_holding_days": float(np.mean([t.holding_days for t in closed])),
-                    "stop_rate": float(
-                        np.mean([t.exit_reason == "exit_stop" for t in closed])
-                    ),
-                }
-            )
+    closed = [t for t in (trades or []) if t.exit_date is not None]
+    if closed:
+        pnls = np.array([t.pnl_return for t in closed])
+        out.update({
+            "n_trades": len(closed),
+            "hit_rate": float((pnls > 0).mean()),
+            "avg_win": float(pnls[pnls > 0].mean()) if (pnls > 0).any() else np.nan,
+            "avg_loss": float(pnls[pnls < 0].mean()) if (pnls < 0).any() else np.nan,
+            "avg_holding_days": float(np.mean([t.holding_days for t in closed])),
+            "stop_rate": float(np.mean([t.exit_reason == "exit_stop" for t in closed])),
+        })
 
     if gross_exposure is not None:
         out["avg_gross_exposure"] = float(gross_exposure.mean())

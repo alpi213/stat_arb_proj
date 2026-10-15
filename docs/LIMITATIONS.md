@@ -1,51 +1,108 @@
-# Limitations — what this project does NOT model, and why it matters
+# Known limitations
 
-Listing these is not an apology; it is the boundary of validity of the results.
+This section lists what the backtests leave out and which way each gap pushes the results. 
+Every number in the README should be read with these caveats in mind.
 
-## Data
+## Equity pairs
 
-1. **Universe is survivor-tilted.** PIT interface exists, PIT membership data is not
-   wired (see DATA.md). Effect: results biased **up**.
-2. **Daily bars only.** Intraday spread dynamics, overnight vs intraday gap risk, and
-   the actual fill price within the day are invisible. Effect: understates execution
-   risk; a close-to-close backtest can't see that the z-score touched ±4 intraday.
-3. **Yahoo data quality.** Restated adjustments, occasional bad prints. Mitigated by
-   the quality layer, not eliminated.
+### Data
 
-## Execution & costs
+1. **Survivorship bias.** The universe is a fixed list of large companies that have been around
+   for a long time. Pairs where one company went bankrupt or was acquired never 
+   make it in, so results look **better** than they would have in real time.
+2. **Daily prices only.** The backtest can't see how the spread moved during the day, 
+   overnight gaps, or the exact price a trade would have filled at. Execution risk is understated.
+3. **Yahoo data quality.** Yahoo sometimes restates its price adjustments and occasionally 
+   publishes bad prices. The data-quality checks catch most of this, but not all of it.
 
-4. **Fills at next close, always available.** No partial fills, no halts, no
-   auction dynamics. One full bar of latency is conservative in timing but
-   optimistic in fill certainty.
-5. **Flat cost assumptions** (1 bp commission, 2.5 bp half-spread, 50 bp/yr borrow,
-   uniform across names and time). Reality: spreads widen exactly when pairs
-   dislocate (costs and opportunities are correlated); borrow on specials can be
-   100s of bps. Effect: biased **up** in stress periods.
-6. **Borrow availability assumed.** Shorts are never recalled. In 2020-03 style
-   stress, recalls force-close exactly the positions you most want to keep.
-7. **No dividend flows on shorts** (short pays the dividend) and **no financing
-   spread** on margin. Partially offset by using total-return-adjusted prices, but
-   not exact.
+### Execution and costs
 
-## Modeling
+4. Every trade fills in full at the next day's closing price. Partial fills, trading halts
+   and auctions are not modelled.
+5. Costs are the same for every stock and every period: 1 bp commission, 2.5 bp half-spread
+   and 50 bp a year to borrow shares for shorting. In reality, spreads widen exactly when pairs 
+   drift apart, and hard-to-borrow stocks can cost several percent a year. In stressed markets 
+   this makes results look **better** than they would be.
+6. Borrowed shares are never called back. In a crisis like March 2020, lenders recall shares 
+   and force you to close exactly the short positions you most want to keep.
+7. Dividends owed on short positions and the financing cost of margin are not included.
 
-8. **Cointegration can break permanently** (mergers, index changes, business model
-   divergence). The stop + time-stop + walk-forward re-selection mitigate; nothing
-   eliminates regime risk. The 2022 slice in the regime report is the stress test.
-9. **Impact model is a calibration guess.** The √-law form is well-supported
-   empirically, but `k` is set a priori (default 0.1, sensitivity reported), not
-   estimated from own executions — estimating it requires trading. Capacity numbers
-   are order-of-magnitude, and should be presented that way.
-10. **Pair-level Kalman `delta` is global**, not tuned per pair — deliberate, to keep
-    the hypothesis count down for the DSR. A per-pair tune would need nested
-    walk-forward.
-11. **Net exposure is only approximately zero** (dollar-neutral per pair with
-    beta-weighted legs; no portfolio-level beta neutralization against SPY). Residual
-    market beta is small but nonzero — report it, or add a beta hedge overlay as an
-    extension.
+### Modelling
 
-## Statistical
+8. Two stocks that have always moved together can stop doing so for good, for example 
+   after a merger or when the businesses go in different directions. Stop losses, time limits 
+   and regular re-selection of pairs reduce this risk, but nothing removes it.
+9. The market impact coefficient `k` is set to an assumed value (0.1) rather than estimated 
+   from real trades, so the capacity figures are rough orders of magnitude.
+10. The Kalman filter's `delta` parameter is shared by all pairs instead of tuned for each one. 
+    This choice allows fewer tuned parameters, which means fewer hypotheses tested, 
+    therefore keeps the Deflated Sharpe Ratio accurate.
+11. The portfolio is only roughly market-neutral. Each pair is dollar-neutral, but there is no hedge
+     against overall market moves (beta) at the portfolio level.
 
-12. **One history.** Every number is one sample path of one decade. The DSR corrects
-    for selection across pairs/configs, not for the fact that 2015-2025 happened only
-    once. Bootstrap confidence intervals on Sharpe are a cheap addition (extension).
+### Statistical
+
+12. The test covers one decade, and that decade only happened once. The Deflated Sharpe Ratio
+     corrects for having picked the best pairs and settings, but not for the fact that 
+    2015–2025 is a single draw from history.
+
+## Crypto funding carry
+
+### Data
+
+1. **Survivorship bias: measured, and small.** The test universe includes every perpetual future
+    ever listed on Binance (901 contracts, 244 of them since delisted). Compared with testing 
+   only the contracts that survived, the Sharpe ratio is inflated by just +0.02 on the full sample 
+   and +0.10 out of sample. Being delta-neutral is what protects the strategy: when a coin 
+   collapses, the long and the short leg fall together. LUNA's entire collapse (LUNAUSDT) 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+   moved the portfolio by only +0.025% of assets.
+
+   Getting to that number took three bug fixes, and two wrong conclusions along the way:
+
+   a. *Stale prices at delisting.* The futures contract and the spot coin stop trading at different times. Filling each one forward separately froze one leg while the other kept moving. On a single LUNAUSDT bar this showed up as spot down 96% and the perp unchanged. The fix cuts both legs at the last moment both genuinely traded.
+
+   b. *Bars with no trades treated as real prices.* Binance keeps publishing bars for a dead contract with zero volume and a frozen price. UNFIUSDT's perp sat at 1.730 for seven days while spot kept trading. The fix treats a bar with no trades as having no price, and a coin is only eligible if its current bar actually traded.
+
+   c. *No limit per coin.* Weights were set as `sign / len(held)`, so as coins dropped out the book became concentrated: at one point it held 3 names, with 33% in UNFIUSDT while it was being delisted. The fix caps each coin at 15% (`max_weight_per_symbol=0.15`). When few coins qualify, part of the capital simply stays uninvested.
+
+   Earlier versions of this document reported inflation of +0.16 / +0.04 with a −11.4% drawdown, and described the UNFIUSDT loss as a genuine delisting event. Both came from bugs (b) and (c).
+
+   **The assumption the result depends on most:** bars with no trades are treated as missing, so a position in a dying coin exits at its last good price at no cost. Charging a penalty on every such exit lowers the out-of-sample Sharpe from 5.60 (no penalty) to 4.74 (10%), 2.87 (25%) and 1.73 (50%). Modeling these exits properly is the most valuable open item.
+2. **One exchange.** Anything specific to Binance, such as a temporary mispricing, shows up here as profit.
+3. **8-hour bars.** Trades are assumed to happen at the close of the funding settlement bar.
+4. The forecast uses the funding rate that was actually paid, not the rate Binance predicts in real time. A live system would use the predicted rate, so if anything the signal here is conservative.
+
+### Execution and cost
+
+5. Both legs pay taker fees at every rebalance (4 bp on futures, 7.5 bp on spot). A trading desk would post passive maker orders and pay far less, but then one leg might not fill and leave an unhedged position, which isn't modeled. The cost-sensitivity table covers the full range of fees.
+6. In the backtest, costs grow in a straight line with trading volume. The capacity script adds market impact on top.
+7. The hedge is assumed to be perfectly neutral. Real hedges drift between rebalances and cost money to correct.
+8. When carry is negative and the strategy shorts spot, no borrowing cost is charged.
+
+### Structural and tail risk
+
+9. **Liquidation.** The trade is short the perpetual future. In a sharp rally, shorts face margin calls at exactly the moment funding moves against them. Margin is not modeled.
+10. **Counterparty risk.** The money sits on a centralized exchange. The FTX collapse (November 2022) falls inside the test period, and anyone with funds there lost all of it. This is the largest risk the model leaves out, and adding more coins on the same exchange does nothing to diversify it.
+11. A withdrawal freeze or a stablecoin losing its peg would hit the collateral and the quote currency at the same time.
+12. The funding premium exists because leveraged buyers outnumber sellers. It has shrunk as more traders joined in (2019 paid far more than 2024).
+
+### Statistical
+
+13. About 3.5 years of data, one exchange and one market cycle. That is short compared with equity backtests.
+14. The 39 positions behave like 28.2 independent bets (the average correlation between them is 0.010). That is better than the starting assumption that they would all move as a single factor. It is recorded here because that assumption turned out to be wrong.
+15. Before the `max_predicted_bps` filter was added, one coin, TRBUSDT, made up 36% of gross profit. Any carry backtest without a filter like this is probably reporting a single squeeze rather than a repeatable edge.
+16. Returns are far from normally distributed (out-of-sample skew +1.8, kurtosis around 70). The Sharpe ratio summarizes them poorly, which is why the Deflated Sharpe Ratio, which adjusts directly for skew and kurtosis, is used instead.

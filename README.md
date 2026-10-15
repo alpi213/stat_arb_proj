@@ -1,342 +1,261 @@
-**Disclaimer:** This repository is a personal research project conducted independently by the author. It was created using publicly available market data and executed entirely on personal hardware and personal time. It does not contain any proprietary information, data or technology belonging to any employer, past or persent, nor does it reflect the views or strategies of any financial institution. 
+**Disclaimer:** This repository is a personal research project conducted independently by the author.
+It was created using publicly available market data and executed entirely on personal hardware
+and personal time. It does not contain any proprietary information, data or technology belonging 
+to any employer, past or present, nor does it reflect the views or strategies of any financial institution.
 
-# Statistical Arbitrage: Cointegration Pairs with Dynamic Hedging & Capacity Analysis
+# Does the edge survive costs, and how much capital can it take?
 
-A mid-frequency equity pairs-trading research framework built around one question most
-backtests dodge: **does the edge survive costs, and how much capital can it absorb?**
+Two strategies run through the same set of checks: execution lag, realistic
+costs, walk-forward selection, a multiple-testing correction, a null
+experiment, and a capacity curve.
 
-- **Signal**: Engle-Granger cointegration within sectors, spread z-score entry/exit with
-  hard and time stops.
-- **Hedging**: static OLS baseline vs. **Kalman-filter dynamic hedge ratio** (before/after
-  comparison is a first-class output).
-- **Honesty layer**: execution lag enforced by construction, commissions + spread +
-  **short borrow fees**, point-in-time universe interface, walk-forward re-selection,
-  **Deflated Sharpe Ratio**, regime breakdowns.
-- **Capacity analysis**: square-root-law market impact re-pricing of the trade stream
-  across an AUM grid → *net Sharpe vs. AUM curve* and an explicit capacity estimate.
+- **Equity pairs** (cointegration, static vs Kalman hedge): no edge survives costs.
+  The result is negative and kept that way.
+- 
+- **Crypto funding carry** (long spot, short perp): a real, structural edge.
+  Defensible out-of-sample Sharpe is 1.7 to 5.6 depending on one assumption that is
+  priced explicitly, and capacity is on the order of $30M to $80M.
 
 ## Quickstart
 
 ```bash
 python -m venv .venv
-.venv\Scripts\activate            # Windows (source .venv/bin/activate on Unix)
+.venv\Scripts\activate            # Windows; source .venv/bin/activate elsewhere
 pip install -e ".[dev]"
-pytest                            # verify the engine before trusting any result
+pytest                            # 33 tests, including adversarial no-lookahead tests
+```
 
-python scripts/01_download_data.py    # download + clean + cache prices (yfinance)
+Equity pipeline (all parameters in [configs/base.yaml](configs/base.yaml), outputs in `results/`):
+
+```bash
+python scripts/01_download_data.py    # yfinance -> cleaned parquet
 python scripts/02_select_pairs.py     # cointegration scan on the formation window
-python scripts/03_backtest.py --compare   # static vs kalman, OOS equity + metrics
-python scripts/04_capacity.py         # net Sharpe vs AUM curve
-python scripts/05_walkforward.py      # rolling re-selection — the headline result
-python scripts/06_validate.py         # Deflated Sharpe + regime breakdown
+python scripts/03_backtest.py         # static and Kalman hedge, out of sample
+python scripts/04_capacity.py         # net Sharpe vs AUM
+python scripts/05_walkforward.py      # rolling re-selection: the headline number
+python scripts/06_validate.py         # Deflated Sharpe + regime slices
+python scripts/07_null_experiment.py  # same pipeline on random walks
 ```
 
-All parameters live in [configs/base.yaml](configs/base.yaml). Every experiment =
-config file + git commit hash. Outputs land in `results/` (figures in
-`results/figures/`).
+Crypto pipeline (outputs in `results_crypto/`):
 
-## Repository layout
+```bash
+python scripts/10_build_pit_universe.py                                   # every perp ever listed
+python scripts/11_download_crypto.py --n-symbols 141 --start 2022-01-01 --end 2025-06-30
+python scripts/12_carry_backtest.py
+python scripts/13_carry_walkforward.py
+python scripts/14_crypto_capacity.py
+```
+
+Step 11 reads the point-in-time universe from step 10 and includes contracts that
+have since been delisted. Pass `--survivors-only` to drop them; the difference between
+the two runs is the survivorship measurement below.
+
+## Layout
 
 ```
-configs/            base.yaml (all parameters), universe.csv (point-in-time membership)
+configs/        base.yaml (every equity parameter), universe.csv, universe_perp_pit.csv
 src/statarb/
-  data/             download adapters, parquet store, PIT universe, quality policy
-  pairs/            Engle-Granger, half-life, Johansen, leak-safe selection
-  hedge/            HedgeEstimator interface: StaticHedge, KalmanHedge
-  signals/          rolling z-score + entry/exit/stop state machine
-  backtest/         engine (lagged execution), cost model, metrics
-  capacity/         sqrt-law impact, capacity curve
-  validation/       walk-forward windows, Deflated Sharpe, regime analysis
-  crypto/           Binance adapters, funding-carry panel + signal
-scripts/            numbered pipeline: 01-06 equity, 07-08 sweep/null, 10-12 crypto
-tests/              incl. adversarial no-lookahead tests on the engine
-docs/               ARCHITECTURE, DATA, LIMITATIONS, PRODUCTION, CRYPTO_LIMITATIONS
+  data.py       yfinance download, cleaning policy, parquet store, universe file
+  pairs.py      Engle-Granger, half-life, within-sector pair selection
+  hedge.py      StaticHedge (refit OLS) and KalmanHedge
+  signals.py    rolling z-score and the entry/exit/stop rules
+  backtest/     pair engine with lag and costs; weights engine for carry; metrics
+  capacity.py   square-root impact, capacity curve
+  validation.py walk-forward windows, Deflated Sharpe, regime breakdown
+  pipeline.py   the steps the equity scripts share
+  crypto/       Binance adapters, carry panel, carry signal
+scripts/        01-07 equity, 10-14 crypto; each parses args and writes files
+tests/
+docs/           DESIGN.md, LIMITATIONS.md, PRODUCTION.md
 ```
 
-## Methodology in one page
+## Part I: equity pairs
 
-1. **Universe** (~80 liquid US names + sector ETFs, 2015-2025 daily): membership file
-   carries `entry_date`/`exit_date` per name so delistings force liquidation — the
-   interface is point-in-time even though the shipped list is static
-   (see [docs/LIMITATIONS.md](docs/LIMITATIONS.md)).
-2. **Pair formation**: within-sector only (economic prior + fewer hypotheses). EG test
-   both directions on log prices, keep p < 0.05, half-life in [2, 60] days, positive
-   hedge ratio, ≤2 pairs per name. The number of pairs *tested* is recorded — it feeds
-   the DSR.
-3. **Hedge ratio**: Kalman filter with random-walk state `[alpha, beta]`; the tradeable
-   spread is the *prior* innovation (the posterior has already seen today's price).
-   `delta` controls drift speed; sensitivity reported, not hidden.
-4. **Trading rule**: z-score of spread over rolling 60d. Enter at |z| ≥ 2, exit at
-   |z| ≤ 0.5, hard stop at |z| ≥ 3.5 **with lockout** (a broken pair can't be
-   immediately re-entered), time stop at 40 days.
-5. **Execution & costs**: signal at close *t* → position from close *t+1* (lag ≥ 1
-   enforced by config validation). 1 bp commission + 2.5 bp half-spread per side,
-   50 bp/yr borrow on the short leg. Hedge frozen at entry (no daily re-hedge churn).
-6. **Capacity**: same trade stream re-priced at each AUM with impact
-   `k·σ·√(Q/ADV)`; reports AUM where Sharpe halves and where it dies, plus
-   sensitivity in `k`.
-7. **Validation**: walk-forward (2y formation → 6m trading, rolled), DSR using the
-   *true* count of hypotheses tested, regime slices (COVID crash, 2022 rate shock,
-   2023 banking stress).
+### Method
 
-## Results — the edge does not survive costs
+1. **Universe.** 79 liquid US names plus sector ETFs, daily bars, 2015 to 2025. The
+   list is static, so it leans toward survivors. See [docs/LIMITATIONS.md](docs/LIMITATIONS.md).
+2. **Pairs.** Within sector only. Engle-Granger on log prices in both directions,
+   keep p < 0.05, half-life between 2 and 60 days, positive hedge ratio, at most two
+   pairs per name. The count of pairs tested is saved; it feeds the Deflated Sharpe.
+3. **Hedge ratio.** Kalman filter with a random-walk state [alpha, beta]. The traded
+   spread is the prior innovation (the posterior has already seen today's price).
+   A residual mode is also available and reported.
+4. **Rules.** Z-score over a rolling 60 days. Enter at |z| >= 2, exit at |z| <= 0.5,
+   stop at |z| >= 3.5 with a lockout, time stop at 40 days.
+5. **Execution and costs.** Signal at close t, position from close t+1. The config
+   validator refuses a lag below one bar. 1 bp commission and 2.5 bp half-spread per
+   side, 50 bp a year borrow on the short leg. Beta is frozen at entry.
+6. **Capacity.** The same trade stream re-priced at each AUM with impact
+   k * sigma * sqrt(Q / ADV). Reports where Sharpe halves and where it hits zero.
+7. **Validation.** Walk-forward (two years formation, six months trading, rolled).
+   Deflated Sharpe using the true number of hypotheses. Regime slices for the COVID
+   crash, the 2022 rate shock and the 2023 banking stress.
 
-79 US names + sector ETFs, 2015-2025. **Headline is the walk-forward number**, where
-pairs are re-selected on each trailing formation window and never chosen with knowledge
-of the period they trade.
+### Result: the edge does not survive costs
 
-| Metric                                    | Static hedge                              | Kalman hedge     |
-| ----------------------------------------- | ----------------------------------------- | ---------------- |
-| Sharpe, single-split OOS (2017-2025, net) | −0.03                                    | −0.21           |
-| **Sharpe, walk-forward OOS (net)**  | —                                        | **−0.45** |
-| CAGR (walk-forward)                       | —                                        | −1.24%          |
-| Max drawdown (walk-forward)               | —                                        | −13.1%          |
-| Hit rate / avg holding                    | 62% / 19d                                 | 59% / 3.5d       |
-| Capacity                                  | not meaningful — base Sharpe is negative |                  |
+The headline is the walk-forward number, where pairs are re-selected on each
+trailing window and never chosen with knowledge of the period they trade.
 
-Gross signal *exists* (62-70% hit rates) but average loss exceeds average win and
-round-trip costs of 5-7bps consume the remainder. The Kalman variant churns badly at
-3.5-day holds because a well-specified filter drives its own innovations toward white
-noise — `spread_mode="residual"` was added to address this and is reported, not
-silently swapped in.
+| Metric                                   | Static hedge | Kalman hedge    |
+| ---------------------------------------- | ------------ | --------------- |
+| Sharpe, single split OOS (net)           | -0.03        | -0.21           |
+| **Sharpe, walk-forward OOS (net)** |              | **-0.45** |
+| CAGR, walk-forward                       |              | -1.24%          |
+| Max drawdown, walk-forward               |              | -13.1%          |
+| Hit rate / average holding               | 62% / 19d    | 59% / 3.5d      |
 
-### The number that matters most
+A gross signal exists (62 to 70% hit rates), but the average loss is larger than the
+average win and 5 to 7 bp round trips take the rest. The Kalman variant churns: a
+well-specified filter drives its own innovations toward white noise, so the z-score
+flips sign quickly and trades last 3.5 days.
 
-Per-window walk-forward Sharpes swing from **+2.40 to −2.38** across 6-month segments.
-Cherry-picking the single best 2-year window in 8.5 years of OOS data yields **+1.20**;
-the worst yields −2.16; the median is −0.43. A 2-year Sharpe of 3 is simply not in this
-data, honestly measured.
+Per-window walk-forward Sharpes range from +2.40 to -2.38. The best two-year window
+in 8.5 years of out-of-sample data gives +1.20, the worst -2.16, the median -0.43.
 
-### Null experiment — calibrating the search itself
+### The null experiment
 
-`scripts/08_null_experiment.py` runs the **entire pipeline** on synthetic independent
-random walks with zero cointegration by construction:
+`scripts/07_null_experiment.py` runs the entire pipeline on independent random walks
+with no cointegration by construction.
 
-|                                                            | Value                    |
-| ---------------------------------------------------------- | ------------------------ |
-| Null Sharpe (mean / range)                                 | −0.22 / [−0.51, +0.06] |
-| Pair hypotheses tested                                     | ~26,900                  |
-| **Theoretical expected-max Sharpe under pure noise** | **1.28**           |
+|                                       | Value                  |
+| ------------------------------------- | ---------------------- |
+| Null Sharpe, mean / range             | -0.29 / [-0.62, +0.08] |
+| Pair hypotheses tested                | ~50,000                |
+| Expected best Sharpe under pure noise | **1.32**         |
 
-That 1.28 is the bar. Any result below it is indistinguishable from what search-through-
-noise manufactures on its own. Reporting a strategy Sharpe without this control is an
-uncalibrated claim — the honest conclusion here is a **negative result**, and it is
-worth more than a tuned positive one.
+Anything below 1.32 is what searching through noise produces on its own. The real
+data never clears it, so the honest conclusion is a negative result.
 
-Figures: `results/figures/equity_walkforward.png`, `pair_*_kalman.png`.
+## Part II: crypto funding carry
 
-## What is deliberately NOT modeled
+Perps have no expiry, so exchanges tie them to spot with a funding payment between
+longs and shorts every 8 hours. When leveraged longs crowd in, longs pay shorts. Long
+spot plus short perp collects that payment with no directional exposure. The edge is
+a payment for risk transfer, not a pattern found by searching, which is why it holds
+up out of sample where cointegration did not.
 
-See [docs/LIMITATIONS.md](docs/LIMITATIONS.md) for the full list with rationale:
-intraday execution, borrow availability/recall, PIT index membership (interface built,
-data source not wired), dividends on short positions, margin financing rates.
-Naming what's missing is part of the result.
+### Result (130 Binance USD-M perps, point in time, Jan 2022 to Jun 2025, 8h bars)
 
-## Testing
+| Metric                          | Full sample    | Out of sample  |
+| ------------------------------- | -------------- | -------------- |
+| Sharpe, net of costs            | **5.79** | **5.60** |
+| Sharpe, gross                   | 7.70           | 7.88           |
+| CAGR                            | 22.2%          |                |
+| Max drawdown                    | -2.5%          | -1.9%          |
+| Annual vol                      | 3.5%           | 2.8%           |
+| Annual turnover                 | 45x            |                |
+| Deflated Sharpe (n_trials=1440) |                | 0.9999, passes |
 
-`pytest` runs unit tests for every statistical component against synthetic data with
-known ground truth, plus **adversarial engine tests**: perturbing a future price must
-not change past positions, and the engine must not manufacture Sharpe from independent
-random walks. If you touch the engine, run these first.
-
----
-
-# Part II: Crypto funding carry
-
-The equity strategy's honest verdict was "no edge survives costs." Rather than
-tune it until a number appeared, the framework was pointed at a market where a
-*structural* premium exists: perpetual-futures funding.
-
-Perps have no expiry, so exchanges tether them to spot via a funding payment
-between longs and shorts every 8h. Crowded leveraged longs pay shorts. A
-delta-neutral book — long spot, short perp — collects that payment with no
-directional exposure. The edge is risk transfer, not a statistical artifact,
-which is why it survives out-of-sample where cointegration did not.
-
-## Results (130 Binance USD-M perps, point-in-time, 2022-01 to 2025-06, 8h)
-
-Universe is point-in-time: every perp active at 2022-01-01, **including the 15
-that have since been delisted**. See the survivorship section below.
-
-| Metric                                    | Full sample    | Out-of-sample                  |
-| ----------------------------------------- | -------------- | ------------------------------ |
-| Sharpe (net of costs)                     | **5.79** | **5.60**                 |
-| Sharpe (gross)                            | 7.70           | 7.88                           |
-| CAGR                                      | 22.2%          | —                             |
-| Max drawdown                              | −2.5%         | −1.9%                         |
-| Annual vol                                | 3.5%           | 2.8%                           |
-| Annual turnover                           | 45×           | —                             |
-| **Deflated Sharpe (n_trials=1440)** | —             | **0.9999 — passes 95%** |
-
-**Do not read 5.60 as the forward estimate.** One modelling assumption still
-carries the number: when a contract's book dies while held, the backtest exits
-at the last good price for free. Charging an explicit penalty instead:
+**Do not read 5.60 as a forward estimate.** One assumption carries the number: when a
+contract's book dies while held, the backtest exits at the last good price for free.
+Charging a penalty instead:
 
 | Exit penalty on a dying position | OOS Sharpe |
 | -------------------------------- | ---------- |
-| 0% (current assumption)          | 5.60       |
+| 0% (current)                     | 5.60       |
 | 10%                              | 4.74       |
 | 25%                              | 2.87       |
 | 50%                              | 1.73       |
 
-**The defensible range is OOS Sharpe ~1.7–5.6; a central estimate is ~3–5.**
-Even punishing every dying position by 25% it clears 2.8. Quantifying this
-assumption matters more than the headline figure.
+The defensible range is **1.7 to 5.6**, central estimate 3 to 5.
 
-**Reproducibility.** These figures are produced bit-identically by the commands in
-[Run it](#run-it) below. The pipeline was non-deterministic until a set-iteration bug
-in the position-slot fill was fixed (Python randomizes string hashing per process, so
-back-to-back runs differed by ~0.01 Sharpe and could drop a better-ranked name for a
-worse one); `test_signal_is_deterministic_across_processes` guards it.
+### Costs set viability
 
-### Cost sensitivity — viability is set by fee tier
+| Scenario                | Sharpe, full | Sharpe, OOS |
+| ----------------------- | ------------ | ----------- |
+| Zero cost (upper bound) | 7.70         | 7.88        |
+| VIP / maker-ish (0.5x)  | 6.79         | 6.80        |
+| Retail taker (base)     | 5.79         | 5.60        |
+| Stressed / wide (2x)    | 3.74         | 3.19        |
 
-| Scenario                | Sharpe (full) | Sharpe (OOS) |
-| ----------------------- | ------------- | ------------ |
-| Zero cost (upper bound) | 7.70          | 7.88         |
-| VIP / maker-ish (0.5×) | 6.79          | 6.80         |
-| Retail taker (base)     | 5.79          | 5.60         |
-| Stressed / wide (2×)   | 3.74          | 3.19         |
-
-Viability is set by **execution quality and fee tier**, not signal cleverness.
-The spot leg dominates: ~7.5–10bps at Binance VIP0 with no maker discount, so
-a round trip on both legs costs ~27bps against ~3bps/day of funding. Turnover
-control (sticky book, hysteresis, weekly rebalance) is what makes it clear —
-naive 8h re-ranking turns over ~480×/yr and loses outright.
+A round trip on both legs costs about 27 bp against about 3 bp a day of funding.
+Turnover control (a sticky book, hysteresis, weekly rebalance) is what makes it work.
+Re-ranking every 8 hours turns over about 480x a year and loses money outright.
 
 ### Stress regimes
 
-Re-run on the point-in-time universe with all data fixes applied (the earlier
-version of this table used the pre-fix 40-symbol survivor universe):
+| Regime                            | Return  | Sharpe | Max DD |
+| --------------------------------- | ------- | ------ | ------ |
+| LUNA collapse (May 2022)          | +2.98%  | 20.6   | -0.16% |
+| 3AC / Celsius (Jun 2022)          | +2.21%  | 14.3   | -0.13% |
+| FTX collapse (Nov 2022)           | +1.81%  | 10.6   | -0.29% |
+| 2023 rally (Oct 2023 to Mar 2024) | +13.95% | 10.7   | -0.72% |
+| Aug 2024 unwind                   | +0.09%  | 2.3    | -0.14% |
+| 2025 drawdown (Feb to Apr)        | +2.87%  | 2.8    | -1.89% |
 
-| Regime                            | Return  | Sharpe | Max DD  |
-| --------------------------------- | ------- | ------ | ------- |
-| LUNA collapse (May 2022)          | +2.98%  | 20.6   | −0.16% |
-| 3AC / Celsius (Jun 2022)          | +2.21%  | 14.3   | −0.13% |
-| FTX collapse (Nov 2022)           | +1.81%  | 10.6   | −0.29% |
-| 2023 rally (Oct 2023 – Mar 2024) | +13.95% | 10.7   | −0.72% |
-| Aug-2024 unwind                   | +0.09%  | 2.3    | −0.14% |
-| 2025 drawdown (Feb–Apr)          | +2.87%  | 2.8    | −1.89% |
+Positive in every window. Read the return and drawdown columns, not the Sharpe
+column, which annualizes a two-week window. Carry gained through FTX because panic
+drove funding negative and the short-carry side paid. Capital held on FTX would still
+have gone to zero, and no backtest metric would show it.
 
-Positive in every stress window. The eye-watering in-regime Sharpes are an
-artifact of annualizing a two-week window — read the return and drawdown
-columns, not the Sharpe column.
+### What the diligence found
 
-Carry *gained* through FTX because panic drove funding deeply negative and the
-short-carry side paid. Note the irony carefully: **capital held on FTX would
-have gone to zero regardless**, and no backtest metric would have shown it.
+- **TRBUSDT alone was 36% of gross P&L** before the `max_predicted_bps` gate. Funding
+  of -300 bp per 8h is a short squeeze with an unborrowable spot leg, not carry.
+- **Effective breadth is 28.2** of 39 nominal positions (average pairwise correlation
+  0.010). The expected single crowded-long factor is not there.
+- **99.6% of P&L is funding**, 0.4% basis. It is a pure carry trade, as designed.
+- Removing the top 1, 5, 10 or 20 return periods barely moves Sharpe (4.6 to 4.3).
 
-## What the diligence found (and why it matters more than the Sharpe)
+Six data bugs were found and fixed, each with a regression test: klines indexed by
+open time while using close prices; the spot endpoint silently capping pages at 1000
+and truncating history; millisecond jitter in funding timestamps colliding under
+ceil() and leaving 634 holes (16% of the panel); forward-fill freezing one leg at a
+delisting; zero-volume bars treated as prices; and a set iteration that made results
+depend on Python's per-process hash seed.
 
-- **TRBUSDT alone was 36% of gross P&L** un-gated — the Sept-Oct 2023 squeeze,
-  where 8h funding hit −300bp. Unborrowable spot, manipulated perp: not
-  tradeable carry. The `max_predicted_bps` gate exists for this.
-- **Effective breadth 28.2** of 39 nominal (avg pairwise corr 0.010) — we
-  *assumed* alt carry shared one crowded-long factor and were wrong; measured
-  and corrected in [docs/CRYPTO_LIMITATIONS.md](docs/CRYPTO_LIMITATIONS.md).
-- **99.6% of P&L is the funding component**, 0.4% basis — it is a pure carry
-  trade, as designed, not a disguised directional bet.
-- Removing the top 1/5/10/20 return periods barely moves Sharpe (4.6→4.3), so
-  the edge is broad across time rather than a handful of lucky days.
+### Walk-forward over hyperparameters
 
-Three look-ahead / data bugs were caught building this, each of which inflated
-results before being fixed: klines indexed by open-time while using close
-prices; Binance's spot endpoint capping pages at 1000 (vs 1500) and silently
-truncating history; and millisecond jitter in funding timestamps
-(`00:00:00.006`) colliding under `ceil()` bucketing and blowing 634 holes (16%)
-in the panel. All three now have regression tests.
+The single-split config was chosen by hand after seeing the whole sample.
+`scripts/13_carry_walkforward.py` picks the best config from a 12-point grid on each
+one-year formation window and trades it for the next three months.
 
-## Walk-forward: was the config hand-tuned?
+| Metric                 | Walk-forward OOS (Jan 2023 to Jun 2025) |
+| ---------------------- | --------------------------------------- |
+| Sharpe                 | **7.22**                          |
+| CAGR                   | 22.1%                                   |
+| Max drawdown           | -1.0%                                   |
+| Modal config chosen in | 30% of windows                          |
+| Deflated Sharpe        | 1.00, passes (n_trials=120)             |
 
-The single-split result used hyperparameters chosen by hand after seeing the whole
-sample. `scripts/13_carry_walkforward.py` removes that channel: on each 1-year
-formation window it picks the best config by *in-window* Sharpe from a 12-point grid,
-trades it for the next 3 months out of sample, and stitches the segments.
+This is not the headline. On window 7 (Oct to Dec 2024), varying only `lookback`:
 
-| Metric                    | Walk-forward OOS (2023-01 → 2025-06)   |
-| ------------------------- | --------------------------------------- |
-| Sharpe                    | **7.22**                          |
-| CAGR                      | 22.1%                                   |
-| Max drawdown              | −1.0%                                  |
-| Annual vol                | 2.8%                                    |
-| Modal config chosen in    | 30% of windows                          |
-| **Deflated Sharpe** | **1.00 — passes** (n_trials=120) |
+| lookback | Sharpe | Ann. vol | Max DD | Held UNFIUSDT? |
+| -------- | ------ | -------- | ------ | -------------- |
+| 9        | 3.63   | 3.6%     | -1.0%  | no             |
+| 21       | 0.79   | 10.7%    | -4.4%  | yes, 14.3%     |
+| 63       | 4.92   | 3.2%     | -1.0%  | no             |
 
-### Config stability — a claim this project got wrong, then corrected
+One parameter swings the window from 0.8 to 4.9, and the whole difference is whether
+the book happened to hold one dying contract. The walk-forward picked 63 from formation
+data and could not have known. That is luck, so the lower single-split number is quoted.
 
-An earlier version of this section reported that **"tuning adds only +0.13 Sharpe"**,
-concluding hyperparameters were nearly irrelevant and the premium did all the work.
-**That measurement was taken before the delisting-price and zero-volume fixes, and it
-does not survive them.** Re-tested on window 7 (Oct-Dec 2024), varying only `lookback`:
+### Survivorship, measured
 
-| lookback | Sharpe | Ann. vol | Max DD | Held UNFIUSDT?       |
-| -------- | ------ | -------- | ------ | -------------------- |
-| 9        | 3.63   | 3.6%     | −1.0% | no                   |
-| 21       | 0.79   | 10.7%    | −4.4% | **yes, 14.3%** |
-| 63       | 4.92   | 3.2%     | −1.0% | no                   |
+`scripts/10_build_pit_universe.py` rebuilds the universe from Binance's own archive:
+901 USDT perps ever listed, 244 since delisted, with active windows checked against
+known collapses (LUNAUSDT active Jan 2021 to May 2022). The strategy then ran on the 130
+symbols active at Jan 2022, 15 of them since delisted, and on the 115 survivors alone.
 
-One parameter swings that window's Sharpe from 0.8 to 4.9 — and the entire difference
-is *whether the book happened to hold one dying contract*. The walk-forward picked
-`lookback=63` from formation-window data, before the event; it could not have known.
-**That is luck, not skill**, and the honest reading is that the walk-forward number is
-flattered by having dodged a tail event the fixed-config run walked into.
+|                                    | Sharpe, full | Sharpe, OOS | CAGR  | Max DD |
+| ---------------------------------- | ------------ | ----------- | ----- | ------ |
+| Survivor-only (115)                | 5.81         | 5.68        | 22.9% | -2.6%  |
+| Point-in-time (130, incl. 15 dead) | 5.79         | 5.60        | 22.3% | -2.5%  |
 
-This is why the single-split figure (5.60 OOS) is quoted as the headline rather than
-the walk-forward's 7.22: the gap between them is a tail-risk lottery, not added value
-from adaptation.
+Survivorship inflates Sharpe by +0.02 full and +0.10 OOS. In a delta-neutral book both
+legs collapse together, so the hedge protects you. LUNAUSDT's entire death contributed
++0.025% of AUM.
 
-## Survivorship — measured, not assumed
+An earlier version of this README reported inflation of +0.16 / +0.04 on an -11.4% max
+drawdown and attributed the drawdown to a real UNFIUSDT delisting loss. Both numbers
+were artifacts of two of the data bugs above (a frozen perp marked against a live spot,
+amplified by a missing concentration cap). The corrected numbers are in the table.
 
-Built a true point-in-time universe — 833 USDT perps ever listed on Binance, 180 since
-delisted, verified against known collapses (LUNAUSDT active 2021-01→2022-05, matching
-its depeg) — via `scripts/14_build_pit_universe.py`, sourced from Binance's own archive
-(`data.binance.vision`), not Wayback-scraped snapshots. Then ran the strategy on 130
-symbols active at 2022-01-01, 15 of them since delisted, against the same 115 survivors:
+### Capacity
 
-|                                    | Sharpe (full) | Sharpe (OOS) | CAGR  | Max DD |
-| ---------------------------------- | ------------- | ------------ | ----- | ------ |
-| Survivor-only (115)                | 5.81          | 5.68         | 22.9% | −2.6% |
-| Point-in-time (130, incl. 15 dead) | 5.79          | 5.60         | 22.3% | −2.5% |
-
-**Survivorship inflates Sharpe by only +0.02 full / +0.10 OOS** — far smaller than
-assumed going in. The reason is structural: in a delta-neutral book, when a coin
-collapses *both legs collapse together*, so the hedge protects you. LUNAUSDT
-contributed **+0.025% of AUM** across its entire May 2022 death.
-
-### Getting to that number took three bug fixes, and two wrong conclusions on the way
-
-Measuring survivorship honestly meant backtesting contracts through their own deaths —
-which turned out to be where the data is least trustworthy:
-
-1. **Stale `ffill` at delisting.** `ffill(limit=1)` froze one leg's price for an extra
-   bar when perp and spot stopped printing at different times, fabricating a basis
-   divergence. Fixed by truncating both legs at their shared last real print.
-2. **Zero-volume bars treated as prices.** Binance keeps *publishing* bars for a dying
-   contract — volume 0, price frozen at the last trade. UNFIUSDT printed volume 0 with
-   the perp pinned at 1.730 for **seven days** while spot kept trading. A frozen perp
-   against a live spot is naked directional exposure, not a hedge. Fixed by treating a
-   no-trade bar as having no valid mark.
-3. **No per-symbol concentration cap.** Weights were `sign / len(held)`, so a
-   *shrinking* book silently became a *concentrated* one — it collapsed to 3 names and
-   put 33% of capital into UNFIUSDT mid-delisting. Fixed with `max_weight_per_symbol`;
-   a thin book now runs under-invested rather than concentrated.
-
-**The wrong conclusions, recorded rather than deleted:** an earlier version of this
-README reported survivorship inflation of +0.16/+0.04 on a −11.4% max drawdown, and
-attributed that drawdown to *"UNFIUSDT's real spot delisting causing a genuine −10.6%
-single-symbol loss."* Both were artifacts of bugs 2 and 3. The loss was largely
-fabricated by marking a live spot leg against a frozen perp price, and amplified by the
-missing concentration cap. Corrected numbers are in the table above.
-
-Full detail and mechanism in
-[docs/CRYPTO_LIMITATIONS.md](docs/CRYPTO_LIMITATIONS.md#data).
-
-## Capacity — the question the framework was built for
-
-Capacity analysis only says something about a strategy that has an edge, so this is the
-first time in the project it produces a meaningful curve. Same square-root impact model
-as the equity path (`impact = k·σ·√(Q/ADV)`), re-pricing the *same* trade stream at
-increasing AUM.
+Same square-root impact model as the equity path, applied to the same trade stream.
 
 | AUM   | Net Sharpe | Annual impact drag |
 | ----- | ---------- | ------------------ |
@@ -345,46 +264,21 @@ increasing AUM.
 | $50M  | 3.31       | 7.4%               |
 | $100M | 2.37       | 10.4%              |
 | $250M | 0.78       | 16.5%              |
-| $500M | −0.58     | 23.3%              |
+| $500M | -0.58      | 23.3%              |
 
-**Sharpe halves at ~$77M; reaches zero at ~$373M** (k=0.10, perp ADV basis).
+| Assumption                               | Sharpe halves | Sharpe hits zero |
+| ---------------------------------------- | ------------- | ---------------- |
+| Base (k=0.10, perp ADV)                  | $77M          | $373M            |
+| Conservative (k=0.10, thin-spot haircut) | $30M          | $130M            |
 
-Bounds, because a single point estimate here would be false precision:
+Capacity scales as 1/k^2 and k is set a priori, not calibrated from fills, so these are
+order-of-magnitude figures. The honest read is a $30M to $80M strategy. Carry gets that
+far because the sticky book turns over only 45x a year. Turnover, not Sharpe, sets
+capacity.
 
-| Assumption                               | Sharpe → ½ | Sharpe → 0 |
-| ---------------------------------------- | ------------ | ----------- |
-| Base (k=0.10, perp ADV)                  | $77M         | $373M       |
-| Conservative (k=0.10, thin-spot haircut) | $30M         | $130M       |
+## Before quoting any number
 
-Capacity scales exactly as **1/k²** under the sqrt law, and `k` is the least-known input
-(set a priori, not calibrated from own fills) — so treat these as order-of-magnitude.
-The honest read: this is a **$30-80M strategy**, not a $500M one. Note also that these
-figures inherit the headline Sharpe's costless-exit assumption; on the ~3-5 central
-estimate the capacity numbers scale down accordingly.
-
-The structural insight worth keeping: **turnover, not Sharpe, sets capacity.** Carry
-survives to $77M *because* the sticky book turns over only 45×/yr. The same gross edge
-harvested with naive 8h re-ranking (480×/yr) would both lose money outright at retail
-fees and exhaust its capacity an order of magnitude sooner.
-
-## Run it
-
-```bash
-python scripts/14_build_pit_universe.py
-python scripts/10_download_crypto.py --symbols-file configs/universe_perp_pit.csv     --n-symbols 141 --start 2022-01-01 --end 2025-06-30
-python scripts/11_carry_backtest.py       # headline table above
-python scripts/13_carry_walkforward.py    # walk-forward
-python scripts/12_crypto_capacity.py      # capacity curve
-```
-
-Step 1 reconstructs the point-in-time universe from Binance's archive; step 2
-downloads it *including since-delisted contracts*. Running step 2 without
-`--symbols-file` gives a survivor-only universe and will NOT reproduce the
-numbers above — that difference is the survivorship measurement.
-
-Limitations — read before quoting any number above:
-[docs/CRYPTO_LIMITATIONS.md](docs/CRYPTO_LIMITATIONS.md). The largest
-unmodeled risks are **survivorship** (only currently-listed perps; delisted
-ones died precisely when carry blew up), **exchange counterparty risk**, and
-**no margin/liquidation modeling** — the backtest's smooth equity curve cannot
-be force-closed, but a real position can.
+Read [docs/LIMITATIONS.md](docs/LIMITATIONS.md). The largest unmodeled risks for carry
+are exchange counterparty risk (FTX is inside the sample) and margin or liquidation on
+the short perp leg. For equities, the static universe leans toward survivors, which
+biases an already negative result upward.

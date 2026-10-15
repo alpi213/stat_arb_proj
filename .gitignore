@@ -29,11 +29,9 @@ Thumbs.db
 .vscode/
 .idea/
 
-# Claude Code session/tooling state (not project content)
-.claude/
-
 # Crypto data & results (regenerable)
 data/crypto/
 results_crypto/
 logs/
 configs/universe_perp_pit.csv
+configs/universe.csv

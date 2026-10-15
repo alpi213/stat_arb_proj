@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "statarb"
-version = "0.1.0"
-description = "Cointegration-based statistical arbitrage with dynamic hedging, honest cost modeling, and capacity analysis"
+version = "0.2.0"
+description = "Does a stat-arb edge survive costs, and how much capital can it take? Equity pairs and crypto funding carry."
 readme = "README.md"
 requires-python = ">=3.10"
 authors = [{ name = "Alexandru Pitrop", email = "alex.pitrop24@gmail.com" }]
@@ -44,8 +44,7 @@ target-version = "py310"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "W", "N", "UP", "B"]
-# N806: uppercase locals (X, P, K, H, S, T) are the standard notation in
-# regression and Kalman-filter math; renaming them hurts readability.
+# N806: uppercase locals (X, P, K, H, S, T) are standard regression and Kalman notation.
 ignore = ["N806"]
 
 [tool.mypy]
